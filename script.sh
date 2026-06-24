@@ -1,111 +1,238 @@
 #!/bin/bash
 set -e
 
-SERVER_USER="ubuntu"
-SERVER_IP="192.168.10.50"
-LOCAL_PCAP_DIR="/var/log/nid-agent/pcaps"
-REMOTE_PCAP_DIR="/home/ubuntu/ML-Network-Intrusion-detection/evidence/pcaps/auto"
-KEY="/root/.ssh/nid_sync_key"
+PROJECT_DIR="/home/ubuntu/ML-Network-Intrusion-detection"
+EVIDENCE_DIR="$PROJECT_DIR/evidence"
+FEATURE_DIR="$EVIDENCE_DIR/features"
+EXTRACT_SCRIPT="$FEATURE_DIR/extract_pcap_features.py"
+SERVICE_FILE="/etc/systemd/system/nid-feature-extract.service"
+TIMER_FILE="/etc/systemd/system/nid-feature-extract.timer"
 
-SYNC_SCRIPT="/usr/local/bin/nid-sync-pcaps.sh"
-SERVICE_FILE="/etc/systemd/system/nid-sync-pcaps.service"
-TIMER_FILE="/etc/systemd/system/nid-sync-pcaps.timer"
-
-echo "[+] Setting up automatic PCAP upload from Ubuntu-Host 1 to Ubuntu-Server..."
+echo "[+] Setting up automatic PCAP feature extraction on Ubuntu-Server..."
 
 sudo apt update
-sudo apt install -y openssh-client rsync
+sudo apt install -y python3 tcpdump
 
-echo "[+] Creating SSH key for automatic upload..."
-sudo mkdir -p /root/.ssh
+mkdir -p "$FEATURE_DIR"
 
-if [ ! -f "$KEY" ]; then
-    sudo ssh-keygen -t ed25519 -N "" -f "$KEY"
-fi
+echo "[+] Creating feature extraction script..."
 
-sudo chmod 600 "$KEY"
+cat > "$EXTRACT_SCRIPT" << 'PYEOF'
+#!/usr/bin/env python3
 
-echo
-echo "[+] Testing SSH key login to Ubuntu-Server..."
-if sudo ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_IP" "echo SSH_OK" 2>/dev/null; then
-    echo "[+] SSH key already works."
-else
-    echo
-    echo "[!] SSH key is not installed on Ubuntu-Server yet."
-    echo "[!] You will be asked for the Ubuntu-Server password ONCE."
-    echo
-    sudo ssh-copy-id -i "$KEY.pub" -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_IP"
-fi
+import csv
+import os
+import re
+import subprocess
+from pathlib import Path
 
-echo "[+] Creating remote PCAP folder on Ubuntu-Server..."
-sudo ssh -i "$KEY" -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_IP" "mkdir -p '$REMOTE_PCAP_DIR'"
+BASE_DIR = Path("/home/ubuntu/ML-Network-Intrusion-detection/evidence")
+PCAP_DIRS = [
+    BASE_DIR / "pcaps",
+    BASE_DIR / "pcaps" / "auto"
+]
+LABEL_FILE = BASE_DIR / "labels" / "master-labels.csv"
+OUTPUT_FILE = BASE_DIR / "features" / "dataset_features.csv"
 
-echo "[+] Creating PCAP sync script..."
-sudo tee "$SYNC_SCRIPT" > /dev/null << EOF
-#!/bin/bash
-set -e
+def load_labels():
+    labels = {}
+    if LABEL_FILE.exists():
+        with open(LABEL_FILE, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                labels[row["pcap_file"]] = {
+                    "attack_class": row.get("attack_class", "unknown"),
+                    "attack_type": row.get("attack_type", "unknown")
+                }
+    return labels
 
-SERVER_USER="$SERVER_USER"
-SERVER_IP="$SERVER_IP"
-LOCAL_PCAP_DIR="$LOCAL_PCAP_DIR"
-REMOTE_PCAP_DIR="$REMOTE_PCAP_DIR"
-KEY="$KEY"
-MARKER_DIR="/var/log/nid-agent/synced"
+def run_tcpdump(pcap):
+    try:
+        result = subprocess.run(
+            ["tcpdump", "-nn", "-tt", "-r", str(pcap)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=20
+        )
+        return result.stdout.splitlines()
+    except Exception:
+        return []
 
-mkdir -p "\$MARKER_DIR"
+def extract_features(pcap):
+    lines = run_tcpdump(pcap)
 
-LATEST=\$(ls -1t "\$LOCAL_PCAP_DIR"/*.pcap 2>/dev/null | head -1 || true)
+    packet_count = 0
+    icmp_count = 0
+    arp_count = 0
+    tcp_count = 0
+    udp_count = 0
+    tcp_syn_count = 0
+    tcp_rst_count = 0
+    total_bytes = 0
+    first_time = None
+    last_time = None
+    src_ips = set()
+    dst_ips = set()
 
-for PCAP in "\$LOCAL_PCAP_DIR"/*.pcap; do
-    [ -e "\$PCAP" ] || continue
+    for line in lines:
+        packet_count += 1
 
-    if [ "\$PCAP" = "\$LATEST" ]; then
-        continue
-    fi
+        parts = line.split()
+        if parts:
+            try:
+                ts = float(parts[0])
+                if first_time is None:
+                    first_time = ts
+                last_time = ts
+            except Exception:
+                pass
 
-    SIZE=\$(stat -c%s "\$PCAP")
+        if " ICMP " in line:
+            icmp_count += 1
 
-    if [ "\$SIZE" -le 100 ]; then
-        continue
-    fi
+        if " ARP," in line:
+            arp_count += 1
 
-    FILE_NAME=\$(basename "\$PCAP")
-    MARKER="\$MARKER_DIR/\$FILE_NAME.uploaded"
+        if " UDP," in line:
+            udp_count += 1
 
-    if [ -f "\$MARKER" ]; then
-        continue
-    fi
+        if " Flags " in line:
+            tcp_count += 1
+            if "Flags [S]" in line:
+                tcp_syn_count += 1
+            if "Flags [R" in line:
+                tcp_rst_count += 1
 
-    scp -i "\$KEY" -o StrictHostKeyChecking=no "\$PCAP" "\$SERVER_USER@\$SERVER_IP:\$REMOTE_PCAP_DIR/"
-    touch "\$MARKER"
+        length_match = re.search(r"length (\d+)", line)
+        if length_match:
+            total_bytes += int(length_match.group(1))
 
-    echo "[+] Uploaded \$FILE_NAME"
-done
-EOF
+        ip_match = re.search(r"IP (\d+\.\d+\.\d+\.\d+)\.\d+ > (\d+\.\d+\.\d+\.\d+)\.\d+:", line)
+        if ip_match:
+            src_ips.add(ip_match.group(1))
+            dst_ips.add(ip_match.group(2))
+        else:
+            ip_match = re.search(r"IP (\d+\.\d+\.\d+\.\d+) > (\d+\.\d+\.\d+\.\d+):", line)
+            if ip_match:
+                src_ips.add(ip_match.group(1))
+                dst_ips.add(ip_match.group(2))
 
-sudo chmod +x "$SYNC_SCRIPT"
+    duration = 0
+    if first_time is not None and last_time is not None:
+        duration = round(last_time - first_time, 6)
 
-echo "[+] Creating systemd sync service..."
+    return {
+        "pcap_file": pcap.name,
+        "pcap_path": str(pcap),
+        "packet_count": packet_count,
+        "icmp_count": icmp_count,
+        "arp_count": arp_count,
+        "tcp_count": tcp_count,
+        "udp_count": udp_count,
+        "tcp_syn_count": tcp_syn_count,
+        "tcp_rst_count": tcp_rst_count,
+        "total_bytes": total_bytes,
+        "duration_seconds": duration,
+        "unique_src_ips": len(src_ips),
+        "unique_dst_ips": len(dst_ips)
+    }
+
+def infer_label(features, known_labels):
+    name = features["pcap_file"]
+
+    if name in known_labels:
+        return known_labels[name]["attack_class"], known_labels[name]["attack_type"]
+
+    if features["tcp_syn_count"] >= 20:
+        return "reconnaissance", "possible_syn_scan"
+
+    if features["icmp_count"] > 0 and features["tcp_syn_count"] == 0:
+        return "normal", "icmp_ping_auto"
+
+    return "unknown", "unlabeled"
+
+def main():
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    labels = load_labels()
+    rows = []
+
+    for pcap_dir in PCAP_DIRS:
+        if not pcap_dir.exists():
+            continue
+
+        for pcap in sorted(pcap_dir.glob("*.pcap")):
+            if pcap.stat().st_size <= 100:
+                continue
+
+            features = extract_features(pcap)
+
+            if features["packet_count"] == 0:
+                continue
+
+            attack_class, attack_type = infer_label(features, labels)
+            features["attack_class"] = attack_class
+            features["attack_type"] = attack_type
+
+            rows.append(features)
+
+    fieldnames = [
+        "pcap_file",
+        "pcap_path",
+        "packet_count",
+        "icmp_count",
+        "arp_count",
+        "tcp_count",
+        "udp_count",
+        "tcp_syn_count",
+        "tcp_rst_count",
+        "total_bytes",
+        "duration_seconds",
+        "unique_src_ips",
+        "unique_dst_ips",
+        "attack_class",
+        "attack_type"
+    ]
+
+    with open(OUTPUT_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[+] Extracted features from {len(rows)} PCAP files")
+    print(f"[+] Dataset saved to: {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+chmod +x "$EXTRACT_SCRIPT"
+
+echo "[+] Creating systemd service..."
+
 sudo tee "$SERVICE_FILE" > /dev/null << EOF
 [Unit]
-Description=NID PCAP Upload Service
+Description=NID PCAP Feature Extraction Service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$SYNC_SCRIPT
+User=ubuntu
+ExecStart=/usr/bin/python3 $EXTRACT_SCRIPT
 EOF
 
-echo "[+] Creating systemd sync timer..."
+echo "[+] Creating systemd timer..."
+
 sudo tee "$TIMER_FILE" > /dev/null << EOF
 [Unit]
-Description=Run NID PCAP Upload Every Minute
+Description=Run NID PCAP Feature Extraction Every Minute
 
 [Timer]
 OnBootSec=1min
 OnUnitActiveSec=1min
-Unit=nid-sync-pcaps.service
+Unit=nid-feature-extract.service
 
 [Install]
 WantedBy=timers.target
@@ -114,19 +241,19 @@ EOF
 echo "[+] Reloading systemd..."
 sudo systemctl daemon-reload
 
-echo "[+] Enabling automatic PCAP upload timer..."
-sudo systemctl enable --now nid-sync-pcaps.timer
+echo "[+] Enabling feature extraction timer..."
+sudo systemctl enable --now nid-feature-extract.timer
 
-echo "[+] Running first upload now..."
-sudo systemctl start nid-sync-pcaps.service || true
-
-echo
-echo "[+] Timer status:"
-sudo systemctl status nid-sync-pcaps.timer --no-pager
+echo "[+] Running feature extraction now..."
+sudo systemctl start nid-feature-extract.service
 
 echo
-echo "[+] Files now on Ubuntu-Server:"
-sudo ssh -i "$KEY" -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_IP" "ls -lh '$REMOTE_PCAP_DIR'"
+echo "[+] Feature extraction service status:"
+sudo systemctl status nid-feature-extract.service --no-pager
 
 echo
-echo "[+] Done. Completed PCAP files will now upload to Ubuntu-Server automatically every minute."
+echo "[+] Dataset preview:"
+cat "$FEATURE_DIR/dataset_features.csv"
+
+echo
+echo "[+] Done. PCAP features will now be extracted automatically every minute."
