@@ -1,6 +1,1 @@
-sudo systemctl stop nid-auto-capture 2>/dev/null || true
-sudo systemctl disable nid-auto-capture 2>/dev/null || true
-sudo rm -f /etc/systemd/system/nid-auto-capture.service
-sudo rm -f /usr/local/bin/nid-auto-capture-start.sh
-sudo systemctl daemon-reload
-sudo systemctl reset-failed
+grep -nE "TARGET_IP|detect_lab_subnet|discover_live_hosts|select_target|192\.168\.10\.20|192\.168\.10\.30|META_IP|UBUNTU_IP" attack-demo.sh
