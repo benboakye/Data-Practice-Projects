@@ -1,54 +1,31 @@
 #!/bin/bash
 set -e
 
-PROJECT_DIR="/home/ubuntu/ML-Network-Intrusion-detection"
-MANAGER_DIR="$PROJECT_DIR/Defense System/manager"
-SERVICE_FILE="/etc/systemd/system/nid-manager.service"
-START_SCRIPT="/usr/local/bin/nid-manager-start.sh"
+IFACE="ens192"
+KALI_IP="192.168.10.10"
+LOCAL_PCAP_DIR="/var/log/nid-agent/pcaps"
+SERVICE_FILE="/etc/systemd/system/nid-auto-capture.service"
 
-echo "[+] Setting up NID Manager auto-start service..."
+echo "[+] Setting up automatic PCAP capture on Ubuntu-Host 1..."
 
-if [ ! -d "$MANAGER_DIR" ]; then
-    echo "[!] Manager directory not found:"
-    echo "    $MANAGER_DIR"
-    exit 1
-fi
-
-echo "[+] Installing required packages..."
+echo "[+] Installing tcpdump..."
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip curl
+sudo apt install -y tcpdump
 
-echo "[+] Preparing Python virtual environment..."
-cd "$MANAGER_DIR"
+echo "[+] Creating PCAP directory..."
+sudo mkdir -p "$LOCAL_PCAP_DIR"
+sudo chown root:root "$LOCAL_PCAP_DIR"
 
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-fi
-
-source venv/bin/activate
-pip install -r requirements.txt
-deactivate
-
-echo "[+] Creating start script..."
-sudo tee "$START_SCRIPT" > /dev/null << EOF
-#!/bin/bash
-cd "$MANAGER_DIR"
-exec "$MANAGER_DIR/venv/bin/python" run.py
-EOF
-
-sudo chmod +x "$START_SCRIPT"
-
-echo "[+] Creating systemd service..."
+echo "[+] Creating systemd capture service..."
 sudo tee "$SERVICE_FILE" > /dev/null << EOF
 [Unit]
-Description=NID AI Manager FastAPI Dashboard
+Description=NID Automatic Traffic Capture Service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=ubuntu
-WorkingDirectory=$MANAGER_DIR
-ExecStart=$START_SCRIPT
+Type=simple
+ExecStart=/usr/bin/tcpdump -i $IFACE -nn host $KALI_IP -G 60 -w $LOCAL_PCAP_DIR/traffic-%Y%m%d-%H%M%S.pcap
 Restart=always
 RestartSec=5
 
@@ -59,26 +36,13 @@ EOF
 echo "[+] Reloading systemd..."
 sudo systemctl daemon-reload
 
-echo "[+] Stopping any old nid-manager service..."
-sudo systemctl stop nid-manager 2>/dev/null || true
-
-echo "[+] Enabling and starting nid-manager..."
-sudo systemctl enable --now nid-manager
-
-echo "[+] Waiting for service to start..."
-sleep 5
+echo "[+] Enabling and starting automatic capture..."
+sudo systemctl enable --now nid-auto-capture
 
 echo "[+] Service status:"
-sudo systemctl status nid-manager --no-pager
+sudo systemctl status nid-auto-capture --no-pager
 
 echo
-echo "[+] Testing API:"
-curl --max-time 5 http://192.168.10.50:8080/api/health || {
-    echo
-    echo "[!] API test failed. If you still have 'python run.py' running manually in another terminal, stop it with Ctrl+C and run:"
-    echo "    sudo systemctl restart nid-manager"
-    exit 1
-}
-
-echo
-echo "[+] Done. NID Manager will now start automatically after reboot."
+echo "[+] Done. Ubuntu-Host 1 is now automatically capturing Kali traffic."
+echo "[+] PCAP files will be saved in:"
+echo "    $LOCAL_PCAP_DIR"
