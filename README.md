@@ -1,1 +1,3 @@
-sudo dpkg -i --force-overwrite /var/cache/apt/archives/libgtk-3-0t64_3.24.52-1_amd64.deb
+sudo sed -i 's/-G 60/-G 20/g' /usr/local/bin/nid-auto-capture-start.sh
+sudo systemctl restart nid-auto-capture
+sudo systemctl status nid-auto-capture --no-pager
