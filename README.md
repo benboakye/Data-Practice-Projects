@@ -1,105 +1,98 @@
-ubuntu@cyberx:~/ML-Network-Intrusion-detection/Defense System$ sed -n '1,200p'  manager/app/routes/alerts.py
-from datetime import datetime, timezone
+cd ~/ML-Network-Intrusion-detection
 
-from fastapi import APIRouter, HTTPException, Query
+cat > connect_ml_alerts_api.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
 
-from app.database import get_connection
-from app.models import ATTACK_CLASSES, AlertCreate
+REPO="$HOME/ML-Network-Intrusion-detection"
+DEF="$REPO/Defense System"
+ALERTS_PY="$DEF/manager/app/routes/alerts.py"
+ML_JSON="$REPO/evidence/alerts/latest-alerts.json"
 
-router = APIRouter(prefix="/api/alerts", tags=["alerts"])
+echo "[+] Checking files..."
 
+if [ ! -f "$ALERTS_PY" ]; then
+  echo "[!] alerts.py not found: $ALERTS_PY"
+  exit 1
+fi
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+if [ ! -f "$ML_JSON" ]; then
+  echo "[!] ML JSON alert file not found: $ML_JSON"
+  exit 1
+fi
 
+echo "[+] Backing up alerts.py..."
+cp "$ALERTS_PY" "$ALERTS_PY.bak.$(date +%Y%m%d-%H%M%S)"
 
-@router.get("")
-def list_alerts(limit: int = Query(default=50, le=200)):
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM alerts ORDER BY timestamp DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+echo "[+] Adding ML alert API endpoint..."
 
+python3 - <<'PY'
+from pathlib import Path
 
-@router.get("/stats")
-def alert_stats():
-    conn = get_connection()
-    by_class = conn.execute(
-        """
-        SELECT attack_class, COUNT(*) AS count
-        FROM alerts
-        GROUP BY attack_class
-        ORDER BY count DESC
-        """
-    ).fetchall()
-    total = conn.execute("SELECT COUNT(*) AS total FROM alerts").fetchone()
-    last_hour = conn.execute(
-        """
-        SELECT COUNT(*) AS count FROM alerts
-        WHERE timestamp >= datetime('now', '-1 hour')
-        """
-    ).fetchone()
-    conn.close()
-    return {
-        "total": total["total"] if total else 0,
-        "last_hour": last_hour["count"] if last_hour else 0,
-        "by_class": [dict(row) for row in by_class],
-    }
+repo = Path.home() / "ML-Network-Intrusion-detection"
+alerts_py = repo / "Defense System" / "manager" / "app" / "routes" / "alerts.py"
 
+text = alerts_py.read_text()
 
-@router.post("")
-def create_alert(payload: AlertCreate):
-    if payload.attack_class not in ATTACK_CLASSES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid attack_class. Must be one of: {ATTACK_CLASSES}",
-        )
-    now = _now()
-    conn = get_connection()
-    cur = conn.execute(
-        """
-        INSERT INTO alerts (timestamp, attack_class, source_ip, dest_ip, agent_id, severity, confidence, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            now,
-            payload.attack_class,
-            payload.source_ip,
-            payload.dest_ip,
-            payload.agent_id,
-            payload.severity,
-            payload.confidence,
-            payload.description,
-        ),
+if "import json" not in text:
+    text = text.replace(
+        "from datetime import datetime, timezone\n",
+        "from datetime import datetime, timezone\nimport json\nfrom pathlib import Path\n",
+        1
     )
-    conn.commit()
-    alert_id = cur.lastrowid
-    conn.close()
-    return {"id": alert_id, "timestamp": now, **payload.model_dump()}
 
+endpoint = '''
 
-@router.post("/seed-demo")
-def seed_demo_alerts():
-    """Insert sample alerts for UI testing before ML is connected."""
-    samples = [
-        ("Normal", "192.168.10.10", "192.168.10.20", "low", 0.12, "DNS and HTTP baseline traffic"),
-        ("Recon", "192.168.10.10", "192.168.10.20", "medium", 0.91, "Nmap SYN scan detected"),
-        ("Brute Force", "192.168.10.10", "192.168.10.20", "high", 0.88, "Repeated SSH login failures"),
-        ("Web Attack", "192.168.10.10", "192.168.10.20", "high", 0.85, "SQLi-style HTTP request"),
-        ("Exfiltration", "192.168.10.20", "192.168.10.10", "critical", 0.79, "SCP file transfer session"),
-    ]
-    conn = get_connection()
-    for attack_class, src, dst, severity, confidence, desc in samples:
-        conn.execute(
-            """
-            INSERT INTO alerts (timestamp, attack_class, source_ip, dest_ip, severity, confidence, description)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (_now(), attack_class, src, dst, severity, confidence, desc),
-        )
-    conn.commit()
-    conn.close()
-    return {"status": "seeded", "count": len(samples)}
+@router.get("/ml/latest")
+def latest_ml_alerts(limit: int = Query(default=20, le=200)):
+    """
+    Return latest machine-learning IDS alerts generated from latest-alerts.json.
+    This endpoint connects the deployed ML prediction output to the manager API.
+    """
+    repo_root = Path(__file__).resolve().parents[4]
+    alerts_file = repo_root / "evidence" / "alerts" / "latest-alerts.json"
+
+    if not alerts_file.exists():
+        return []
+
+    try:
+        data = json.loads(alerts_file.read_text())
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="ML alerts JSON file is invalid")
+
+    if not isinstance(data, list):
+        raise HTTPException(status_code=500, detail="ML alerts JSON must contain a list")
+
+    return data[-limit:]
+'''
+
+if '@router.get("/ml/latest")' not in text:
+    text = text.rstrip() + endpoint + "\n"
+
+alerts_py.write_text(text)
+print("[+] alerts.py updated successfully")
+PY
+
+echo "[+] Checking Python syntax..."
+cd "$DEF/manager"
+python3 -m py_compile app/routes/alerts.py
+
+echo "[+] Restarting AI Manager..."
+sudo systemctl restart nid-manager
+sleep 2
+
+echo "[+] Service status:"
+sudo systemctl is-active nid-manager
+
+echo "[+] Testing health endpoint:"
+curl -s http://127.0.0.1:8080/api/health
+echo
+
+echo "[+] Testing ML alerts endpoint:"
+curl -s "http://127.0.0.1:8080/api/alerts/ml/latest?limit=3" | python3 -m json.tool
+
+echo "[+] Done."
+BASH
+
+chmod +x connect_ml_alerts_api.sh
+./connect_ml_alerts_api.sh
